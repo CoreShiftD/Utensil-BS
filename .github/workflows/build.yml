@@ -1,0 +1,123 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/
+
+name: Build utensil-bs
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      ndk_version:
+        description: 'NDK Version to use'
+        required: true
+        default: 'stable'
+        type: choice
+        options:
+        - stable
+        - beta
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [aarch64-linux-android, armv7-linux-androideabi]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Setup Latest SDKManager
+      run: |
+        mkdir -p $ANDROID_HOME/cmdline-tools
+        LATEST_TOOLS_URL=$(curl -s https://developer.android.com/studio/index.html | grep -oP "https://dl.google.com/android/repository/commandlinetools-linux-\d+_latest.zip" | head -n 1)
+        if [[ -z "$LATEST_TOOLS_URL" ]]; then
+          LATEST_TOOLS_URL="https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip"
+        fi
+        wget "$LATEST_TOOLS_URL" -O cmdline-tools.zip
+        unzip cmdline-tools.zip -d $ANDROID_HOME/cmdline-tools
+        mv $ANDROID_HOME/cmdline-tools/cmdline-tools $ANDROID_HOME/cmdline-tools/latest
+        echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> $GITHUB_PATH
+
+    - name: Set NDK Version
+      id: ndk_setup
+      run: |
+        if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          MODE="${{ github.event.inputs.ndk_version }}"
+        else
+          MODE="stable"
+        fi
+
+        echo "Resolving NDK via sdkmanager..."
+        if [[ "$MODE" == "stable" ]]; then
+          PACKAGE_ID=$(sdkmanager --list 2>/dev/null | grep "ndk;" | awk '{print $1}' | sort -V | tail -n 1)
+        else
+          PACKAGE_ID=$(sdkmanager --list --include_obsolete 2>/dev/null | grep "ndk;" | awk '{print $1}' | sort -V | tail -n 1)
+        fi
+
+        VERSION=$(echo "$PACKAGE_ID" | cut -d ';' -f 2)
+
+        if [[ -z "$VERSION" ]]; then
+          echo "Error: Could not resolve NDK version for mode=$MODE"
+          exit 1
+        fi
+
+        echo "Resolved NDK Package: $PACKAGE_ID (version=$VERSION)"
+        echo "package_id=$PACKAGE_ID" >> $GITHUB_OUTPUT
+        echo "version=$VERSION"       >> $GITHUB_OUTPUT
+        echo "mode=$MODE"             >> $GITHUB_OUTPUT
+
+    - name: Install NDK
+      run: |
+        echo "y" | sdkmanager "${{ steps.ndk_setup.outputs.package_id }}"
+        NDK_HOME="$ANDROID_HOME/ndk/${{ steps.ndk_setup.outputs.version }}"
+        echo "ANDROID_NDK_HOME=$NDK_HOME" >> $GITHUB_ENV
+        echo "NDK_HOME=$NDK_HOME"         >> $GITHUB_ENV
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: stable
+        targets: ${{ matrix.target }}
+
+    - name: Configure clang linker for target
+      run: |
+        NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+
+        case "${{ matrix.target }}" in
+          aarch64-linux-android)
+            CLANG_TARGET="aarch64-linux-android28-clang"
+            CARGO_TARGET_ENV="CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER"
+            ;;
+          armv7-linux-androideabi)
+            CLANG_TARGET="armv7a-linux-androideabi28-clang"
+            CARGO_TARGET_ENV="CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER"
+            ;;
+        esac
+
+        CLANG_BIN="$NDK_TOOLCHAIN/bin/$CLANG_TARGET"
+
+        if [[ ! -x "$CLANG_BIN" ]]; then
+          echo "Error: clang not found at $CLANG_BIN"
+          ls "$NDK_TOOLCHAIN/bin/" | grep clang || true
+          exit 1
+        fi
+
+        echo "$CARGO_TARGET_ENV=$CLANG_BIN" >> $GITHUB_ENV
+        echo "CC=$CLANG_BIN"                >> $GITHUB_ENV
+        echo "AR=$NDK_TOOLCHAIN/bin/llvm-ar" >> $GITHUB_ENV
+
+        echo "Linker: $CLANG_BIN"
+
+    - name: Build
+      run: |
+        cargo build --release --target ${{ matrix.target }}
+
+    - name: Upload binary
+      uses: actions/upload-artifact@v4
+      with:
+        name: utensil-bs-${{ matrix.target }}
+        path: target/${{ matrix.target }}/release/utensil-bs
