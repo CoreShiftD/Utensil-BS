@@ -12,8 +12,8 @@ use coreshift_core::reactor::{Event, Reactor, Token};
 use coreshift_core::signal::{signal_ignore, SIGHUP, SIGPIPE, SIGTERM};
 use coreshift_core::spawn::{ExitStatus, Process};
 use coreshift_core::unix_socket::{
-    self, connect_unix_stream, UnixConnectResult, UnixSocketAddr, UnixSocketBindOptions,
-    UnixStreamFd,
+    self, connect_unix_stream, connect_unix_stream_named, UnixConnectResult, UnixSocketAddr,
+    UnixSocketBindOptions, UnixStreamFd,
 };
 use coreshift_core::{log_error, log_info, log_warn};
 use std::collections::HashMap;
@@ -21,13 +21,14 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-const TAG:         &str = "utensil-bs";
-const SOCKET:      &[u8] = b"coreshift_batterystats";
-const SYSFS_CAP:   &str = "/sys/class/power_supply/battery/capacity";
-const CHARGE_PROP: &str = "debug.tracing.charge_state";
-const DATA_DIR:    &str = "/data/local/tmp/Utensil";
-const PID_FILE:    &str = "/data/local/tmp/Utensil/bs.pid";
-const LOG_FILE:    &str = "/data/local/tmp/Utensil/bs.log";
+const TAG:            &str = "utensil-bs";
+const SOCKET:         &[u8] = b"coreshift_batterystats";
+const SOCKET_WATCHER: &[u8] = b"coreshift_bs_consumer";
+const SYSFS_CAP:      &str  = "/sys/class/power_supply/battery/capacity";
+const CHARGE_PROP:    &str  = "debug.tracing.charge_state";
+const DATA_DIR:       &str  = "/data/local/tmp/Utensil";
+const PID_FILE:       &str  = "/data/local/tmp/Utensil/bs.pid";
+const LOG_FILE:       &str  = "/data/local/tmp/Utensil/bs.log";
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -58,8 +59,17 @@ fn broadcast(watchers: &mut HashMap<Token, UnixStreamFd>, msg: &[u8], reactor: &
 }
 
 fn connect() -> Result<UnixStreamFd, Box<dyn std::error::Error>> {
-    let addr = UnixSocketAddr::Abstract(SOCKET);
-    match connect_unix_stream(addr)? {
+    match connect_unix_stream(UnixSocketAddr::Abstract(SOCKET))? {
+        UnixConnectResult::Connected(s) => Ok(s),
+        UnixConnectResult::InProgress(_) => Err("connection in progress".into()),
+    }
+}
+
+fn connect_as_consumer() -> Result<UnixStreamFd, Box<dyn std::error::Error>> {
+    match connect_unix_stream_named(
+        UnixSocketAddr::Abstract(SOCKET),
+        UnixSocketAddr::Abstract(SOCKET_WATCHER),
+    )? {
         UnixConnectResult::Connected(s) => Ok(s),
         UnixConnectResult::InProgress(_) => Err("connection in progress".into()),
     }
@@ -68,7 +78,7 @@ fn connect() -> Result<UnixStreamFd, Box<dyn std::error::Error>> {
 // ── subcommands ───────────────────────────────────────────────────────────────
 
 fn cmd_watch() -> Result<(), Box<dyn std::error::Error>> {
-    let stream = connect().map_err(|_| "daemon not running")?;
+    let stream = connect_as_consumer().map_err(|_| "daemon not running")?;
     let mut reactor = Reactor::new()?;
     let tok = reactor.add(&stream.fd, true, false)?;
     let mut events = Vec::new();
@@ -82,6 +92,26 @@ fn cmd_watch() -> Result<(), Box<dyn std::error::Error>> {
                 Some(n) => io::stdout().write_all(&buf[..n])?,
             }
         }
+    }
+}
+
+fn cmd_uevent_dump() -> Result<(), Box<dyn std::error::Error>> {
+    let fd = netlink::uevent_open()?;
+    eprintln!("listening for uevents (Ctrl-C to stop)...");
+    let mut buf = [0u8; 4096];
+    loop {
+        // Blocking recv: spin until kernel delivers an event.
+        let n = loop {
+            if let Some(n) = netlink::uevent_recv(&fd, &mut buf) { break n; }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let fields: Vec<&str> = buf[..n]
+            .split(|&b| b == 0)
+            .filter_map(|s| std::str::from_utf8(s).ok())
+            .filter(|s| !s.is_empty())
+            .collect();
+        println!("--- uevent ({n}b) ---");
+        for f in &fields { println!("  {f}"); }
     }
 }
 
@@ -268,13 +298,17 @@ fn run_daemon() {
         }
 
         if do_uevent {
-            if let Some((cap, status)) = netlink::uevent_drain_battery(&uevent_fd) {
+            if let Some((msg_cap, status)) = netlink::uevent_drain_battery(&uevent_fd) {
                 let _ = android_property_set(CHARGE_PROP, &status);
-                if last_level != Some(cap) {
-                    last_level = Some(cap);
-                    log_info!(TAG, "level={cap} charge_state={status}");
-                    let msg = format!("{cap}\n");
-                    broadcast(&mut watchers, msg.as_bytes(), &mut reactor);
+                // POWER_SUPPLY_CAPACITY absent in some uevent payloads; fall back to sysfs.
+                let cap = msg_cap.or_else(read_level);
+                if let Some(cap) = cap {
+                    if last_level != Some(cap) {
+                        last_level = Some(cap);
+                        log_info!(TAG, "level={cap} charge_state={status}");
+                        let msg = format!("{cap}\n");
+                        broadcast(&mut watchers, msg.as_bytes(), &mut reactor);
+                    }
                 }
             }
         }
@@ -305,11 +339,12 @@ fn run_daemon() {
 fn print_usage() {
     println!("Usage: utensil-bs <command>");
     println!("Commands:");
-    println!("  daemon   Start the battery-status daemon (supervised, detached)");
-    println!("  stop     Stop the running daemon");
-    println!("  restart  Stop then start the daemon");
-    println!("  status   Print current battery level");
-    println!("  watch    Stream battery level changes to stdout");
+    println!("  daemon       Start the battery-status daemon (supervised, detached)");
+    println!("  stop         Stop the running daemon");
+    println!("  restart      Stop then start the daemon");
+    println!("  status       Print current battery level");
+    println!("  watch        Stream battery level changes to stdout");
+    println!("  uevent-dump  Dump raw kernel uevents (for debugging)");
 }
 
 fn main() {
@@ -330,9 +365,10 @@ fn main() {
             }
             run_supervisor()
         }
-        "status" => cmd_status(),
-        "watch"  => cmd_watch(),
-        _        => { print_usage(); return; }
+        "status"       => cmd_status(),
+        "watch"        => cmd_watch(),
+        "uevent-dump"  => cmd_uevent_dump(),
+        _              => { print_usage(); return; }
     };
 
     if let Err(e) = result {
