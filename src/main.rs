@@ -3,12 +3,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/
 
 use coreshift_core::android_property::{android_property_get, android_property_set};
+use coreshift_core::inotify;
 use coreshift_core::netlink;
 use coreshift_core::process::{
     close_fds_from, fork, redirect_fd_to, redirect_stdio_to_devnull, set_pdeathsig, setsid,
     setpgid, ForkResult,
 };
-use coreshift_core::reactor::{Event, Reactor, Token};
+use coreshift_core::reactor::{Event, Fd, Reactor, Token};
 use coreshift_core::signal::{signal_ignore, SIGHUP, SIGPIPE, SIGTERM};
 use coreshift_core::spawn::{ExitStatus, Process};
 use coreshift_core::unix_socket::{
@@ -25,15 +26,82 @@ const TAG:            &str = "utensil-bs";
 const SOCKET:         &[u8] = b"coreshift_batterystats";
 const SOCKET_WATCHER: &[u8] = b"coreshift_bs_consumer";
 const SYSFS_CAP:      &str  = "/sys/class/power_supply/battery/capacity";
+const SYSFS_STATUS:   &str  = "/sys/class/power_supply/battery/status";
 const CHARGE_PROP:    &str  = "debug.tracing.charge_state";
 const DATA_DIR:       &str  = "/data/local/tmp/Utensil";
 const PID_FILE:       &str  = "/data/local/tmp/Utensil/bs.pid";
 const LOG_FILE:       &str  = "/data/local/tmp/Utensil/bs.log";
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── battery event source ──────────────────────────────────────────────────────
+
+enum BatterySource {
+    /// inotify on sysfs capacity + status files. Event means: re-read sysfs.
+    Inotify(Fd),
+    /// NETLINK_KOBJECT_UEVENT. Event drains messages and returns parsed values.
+    Uevent(Fd),
+}
+
+impl BatterySource {
+    /// Try inotify first; fall back to uevent on EPERM.
+    fn open() -> Result<Self, coreshift_core::CoreError> {
+        match inotify::init() {
+            Ok(fd) => {
+                let cap_ok = inotify::add_watch(&fd, SYSFS_CAP, inotify::MODIFY_MASK).is_ok();
+                let _      = inotify::add_watch(&fd, SYSFS_STATUS, inotify::MODIFY_MASK);
+                if cap_ok {
+                    return Ok(BatterySource::Inotify(fd));
+                }
+                // inotify init succeeded but watch failed (sysfs ACL) — try uevent.
+            }
+            Err(_) => {}
+        }
+        netlink::uevent_open().map(BatterySource::Uevent)
+    }
+
+    fn fd(&self) -> &Fd {
+        match self {
+            BatterySource::Inotify(fd) | BatterySource::Uevent(fd) => fd,
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            BatterySource::Inotify(_) => "inotify",
+            BatterySource::Uevent(_)  => "uevent",
+        }
+    }
+
+    /// Called when the reactor fires for this source.
+    /// Returns `(level, status)` if a meaningful change was detected.
+    fn drain(&self) -> Option<(u8, String)> {
+        match self {
+            BatterySource::Inotify(fd) => {
+                // Drain all pending inotify events (EPOLLET).
+                let _ = inotify::read_events(fd);
+                let cap    = read_level()?;
+                let status = read_status();
+                Some((cap, status))
+            }
+            BatterySource::Uevent(fd) => {
+                let (msg_cap, status) = netlink::uevent_drain_battery(fd)?;
+                let cap = msg_cap.or_else(read_level)?;
+                Some((cap, status))
+            }
+        }
+    }
+}
+
+// ── sysfs helpers ─────────────────────────────────────────────────────────────
 
 fn read_level() -> Option<u8> {
     std::fs::read_to_string(SYSFS_CAP).ok()?.trim().parse().ok()
+}
+
+fn read_status() -> String {
+    std::fs::read_to_string(SYSFS_STATUS)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 fn status_str(raw: &str) -> &'static str {
@@ -46,6 +114,8 @@ fn status_str(raw: &str) -> &'static str {
     }
 }
 
+// ── broadcast ─────────────────────────────────────────────────────────────────
+
 fn broadcast(watchers: &mut HashMap<Token, UnixStreamFd>, msg: &[u8], reactor: &mut Reactor) {
     let dead: Vec<Token> = watchers
         .iter()
@@ -57,6 +127,8 @@ fn broadcast(watchers: &mut HashMap<Token, UnixStreamFd>, msg: &[u8], reactor: &
         if let Some(s) = watchers.remove(&tok) { let _ = reactor.del(&s.fd); }
     }
 }
+
+// ── socket helpers ────────────────────────────────────────────────────────────
 
 fn connect() -> Result<UnixStreamFd, Box<dyn std::error::Error>> {
     match connect_unix_stream(UnixSocketAddr::Abstract(SOCKET))? {
@@ -100,7 +172,6 @@ fn cmd_uevent_dump() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("listening for uevents (Ctrl-C to stop)...");
     let mut buf = [0u8; 4096];
     loop {
-        // Blocking recv: spin until kernel delivers an event.
         let n = loop {
             if let Some(n) = netlink::uevent_recv(&fd, &mut buf) { break n; }
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -158,7 +229,6 @@ fn run_supervisor() -> Result<(), Box<dyn std::error::Error>> {
     match unsafe { fork()? } {
         ForkResult::Parent(pid) => {
             let _ = Process::new(pid).wait_blocking();
-            // Poll for socket readiness as daemon-ready signal.
             let start = Instant::now();
             loop {
                 if connect_unix_stream(addr).is_ok() { break; }
@@ -173,7 +243,6 @@ fn run_supervisor() -> Result<(), Box<dyn std::error::Error>> {
         ForkResult::Child => {}
     }
 
-    // Middle child.
     let _ = setsid();
     let _ = setpgid(0, 0);
 
@@ -182,7 +251,6 @@ fn run_supervisor() -> Result<(), Box<dyn std::error::Error>> {
         ForkResult::Child => {}
     }
 
-    // Grandchild = supervisor.
     unsafe { let _ = redirect_stdio_to_devnull(); }
 
     let pid_file = Path::new(PID_FILE);
@@ -239,12 +307,12 @@ fn run_supervisor() -> Result<(), Box<dyn std::error::Error>> {
 fn run_daemon() {
     log_info!(TAG, "start pid={}", std::process::id());
 
-    let mut reactor = Reactor::new().unwrap_or_else(|e| {
-        log_error!(TAG, "reactor: {e}"); std::process::exit(1);
+    let source = BatterySource::open().unwrap_or_else(|e| {
+        log_error!(TAG, "battery source: {e}"); std::process::exit(1);
     });
 
-    let uevent_fd = netlink::uevent_open().unwrap_or_else(|e| {
-        log_error!(TAG, "netlink uevent: {e}"); std::process::exit(1);
+    let mut reactor = Reactor::new().unwrap_or_else(|e| {
+        log_error!(TAG, "reactor: {e}"); std::process::exit(1);
     });
 
     let listener = unix_socket::bind_unix_listener(
@@ -256,22 +324,26 @@ fn run_daemon() {
         std::process::exit(1);
     });
 
-    let uevent_tok   = reactor.add(&uevent_fd,   true, false).expect("add uevent");
+    let source_tok   = reactor.add(source.fd(), true, false).expect("add source");
     let listener_tok = reactor.add(&listener.fd, true, false).expect("add listener");
 
     let mut watchers: HashMap<Token, UnixStreamFd> = HashMap::new();
     let mut events: Vec<Event> = Vec::new();
     let mut last_level: Option<u8> = read_level();
 
-    let init_status = status_str(
-        android_property_get("debug.tracing.battery_status")
-            .as_deref()
-            .unwrap_or(""),
-    );
-    let _ = android_property_set(CHARGE_PROP, init_status);
+    // Initial charge state: inotify path reads sysfs directly; uevent path uses the property.
+    let init_status = match &source {
+        BatterySource::Inotify(_) => read_status(),
+        BatterySource::Uevent(_)  => status_str(
+            android_property_get("debug.tracing.battery_status")
+                .as_deref()
+                .unwrap_or(""),
+        ).to_string(),
+    };
+    let _ = android_property_set(CHARGE_PROP, &init_status);
 
-    log_info!(TAG, "listening @{} level={:?} charge={init_status}",
-              String::from_utf8_lossy(SOCKET), last_level);
+    log_info!(TAG, "source={} listening @{} level={:?} charge={init_status}",
+              source.name(), String::from_utf8_lossy(SOCKET), last_level);
 
     loop {
         events.clear();
@@ -280,12 +352,12 @@ fn run_daemon() {
             Ok(_) => {}
         }
 
-        let mut do_uevent   = false;
+        let mut do_source  = false;
         let mut do_listener = false;
         let mut dead: Vec<Token> = Vec::new();
 
         for ev in &events {
-            if ev.token == uevent_tok        { do_uevent   = true; }
+            if ev.token == source_tok        { do_source   = true; }
             else if ev.token == listener_tok { do_listener = true; }
             else if ev.hangup || ev.error    { dead.push(ev.token); }
         }
@@ -297,18 +369,14 @@ fn run_daemon() {
             }
         }
 
-        if do_uevent {
-            if let Some((msg_cap, status)) = netlink::uevent_drain_battery(&uevent_fd) {
+        if do_source {
+            if let Some((cap, status)) = source.drain() {
                 let _ = android_property_set(CHARGE_PROP, &status);
-                // POWER_SUPPLY_CAPACITY absent in some uevent payloads; fall back to sysfs.
-                let cap = msg_cap.or_else(read_level);
-                if let Some(cap) = cap {
-                    if last_level != Some(cap) {
-                        last_level = Some(cap);
-                        log_info!(TAG, "level={cap} charge_state={status}");
-                        let msg = format!("{cap}\n");
-                        broadcast(&mut watchers, msg.as_bytes(), &mut reactor);
-                    }
+                if last_level != Some(cap) {
+                    last_level = Some(cap);
+                    log_info!(TAG, "level={cap} charge_state={status}");
+                    let msg = format!("{cap}\n");
+                    broadcast(&mut watchers, msg.as_bytes(), &mut reactor);
                 }
             }
         }
@@ -356,7 +424,6 @@ fn main() {
         "stop"   => cmd_stop(),
         "restart" => {
             cmd_stop().ok();
-            // Wait for socket to disappear.
             let addr = UnixSocketAddr::Abstract(SOCKET);
             let start = Instant::now();
             while start.elapsed() < Duration::from_secs(3) {
@@ -365,10 +432,10 @@ fn main() {
             }
             run_supervisor()
         }
-        "status"       => cmd_status(),
-        "watch"        => cmd_watch(),
-        "uevent-dump"  => cmd_uevent_dump(),
-        _              => { print_usage(); return; }
+        "status"      => cmd_status(),
+        "watch"       => cmd_watch(),
+        "uevent-dump" => cmd_uevent_dump(),
+        _             => { print_usage(); return; }
     };
 
     if let Err(e) = result {
