@@ -1,0 +1,27 @@
+[package]
+name = "utensil-bs"
+version = "0.1.0"
+edition = "2021"
+description = "Android battery-status streaming daemon"
+license = "MPL-2.0"
+repository = "https://github.com/CoreShiftD/Utensil-BS"
+homepage = "https://github.com/CoreShiftD/Utensil-BS"
+readme = "README.md"
+keywords = ["android", "battery", "daemon", "binder", "netlink"]
+categories = ["os::linux-apis"]
+
+[[bin]]
+name = "utensil-bs"
+path = "src/main.rs"
+
+[dependencies]
+coreshift-core = "1.2.11"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+debug = 0
+incremental = false
+strip = "none"
