@@ -74,8 +74,9 @@ impl BatterySource {
                 Some((cap, status))
             }
             BatterySource::Uevent(fd) => {
-                let (msg_cap, status) = netlink::uevent_drain_battery(fd)?;
-                let cap = msg_cap.or_else(read_level)?;
+                let (msg_cap, _) = netlink::uevent_drain_battery(fd)?;
+                let cap    = msg_cap.or_else(read_level)?;
+                let status = read_status();
                 Some((cap, status))
             }
         }
@@ -87,10 +88,15 @@ pub fn read_level() -> Option<u8> {
 }
 
 pub fn read_status() -> String {
-    std::fs::read_to_string(SYSFS_STATUS)
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+    if let Ok(s) = std::fs::read_to_string(SYSFS_STATUS) {
+        return s.trim().to_string();
+    }
+    // sysfs unavailable (permission denied) — fall back to prop
+    status_str(
+        android_property_get("debug.tracing.battery_status")
+            .as_deref()
+            .unwrap_or(""),
+    ).to_string()
 }
 
 pub fn status_str(raw: &str) -> &'static str {
@@ -312,14 +318,7 @@ pub fn run_daemon() {
     let mut events: Vec<Event> = Vec::new();
     let mut last_level: Option<u8> = read_level();
 
-    let init_status = match &source {
-        BatterySource::Inotify(_) => read_status(),
-        BatterySource::Uevent(_)  => status_str(
-            android_property_get("debug.tracing.battery_status")
-                .as_deref()
-                .unwrap_or(""),
-        ).to_string(),
-    };
+    let init_status = read_status();
     let _ = android_property_set(CHARGE_PROP, &init_status);
 
     log_info!(TAG, "source={} listening @{} level={:?} charge={init_status}",
