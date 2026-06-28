@@ -4,9 +4,9 @@ version = 4
 
 [[package]]
 name = "coreshift-core"
-version = "1.2.12"
+version = "1.2.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1942ff2ef8afc8a7dddc9332f978effbc5399e20c8ec2b9a6e2d986b5e690a95"
+checksum = "40ebd0011ccc72e11c74600c78f831b8f3f81f80ece51d4fe0abf1876608fbf7"
 dependencies = [
  "libc",
 ]
@@ -19,7 +19,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "utensil-bs"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "coreshift-core",
 ]

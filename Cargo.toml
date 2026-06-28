@@ -1,6 +1,6 @@
 [package]
 name = "utensil-bs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Android battery-status streaming daemon"
 license = "MPL-2.0"
@@ -15,7 +15,7 @@ name = "utensil-bs"
 path = "src/main.rs"
 
 [dependencies]
-coreshift-core = "1.2.12"
+coreshift-core = "1.2.13"
 
 [profile.release]
 opt-level = 3
